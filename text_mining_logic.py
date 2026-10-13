@@ -63,6 +63,13 @@ MAX_BOOKS_PER_REPO = None  # e.g. 20 for a quick test run; None = every book
 OUTPUT_JSON = "quran_keyword_books.json"
 OUTPUT_SUMMARY = "quran_keyword_summary.md"
 
+# >>> LLM (OpenRouter): suggests synonyms in Cell 1 (optional) and writes the report in Cell 2
+OPENROUTER_MODEL = "openrouter/auto"     # or a specific model, e.g. "anthropic/claude-sonnet-4.5"; see openrouter.ai/models
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+SYNONYMS_PER_KEYWORD = 6                 # most terms the LLM may propose per keyword
+ 
+OUTPUT_JSON = "quran_keyword_books.json"
+OUTPUT_SUMMARY = "quran_keyword_summary.md"
 
 # ---------------------------------------------------------------------------
 # 1. WHICH REPOS, AND GET THEM (async)
@@ -278,9 +285,8 @@ def make_pool(index, patterns):
     _init_worker(index, patterns, QURAN_MIN_WORDS)
     return ThreadPoolExecutor(WORKERS)
 
-
 async def run_pipeline(mode=DEFAULT_MODE, keywords=None, start_ah=START_AH, end_ah=END_AH,
-                       min_quotes=MIN_QURAN_QUOTES):
+                       min_quotes=MIN_QURAN_QUOTES, groups=None):
     """mode: "Q" (Quran quotations), "K" (keywords) or "QK" (both). Returns the results dict
     that is also written to OUTPUT_JSON."""
     keywords = KEYWORDS if keywords is None else keywords
@@ -289,22 +295,22 @@ async def run_pipeline(mode=DEFAULT_MODE, keywords=None, start_ah=START_AH, end_
     if not codes:
         raise ValueError(f"No OpenITI repo covers {start_ah}-{end_ah} AH (repos run 0025AH-1425AH).")
     print(f"Repos for {start_ah}-{end_ah} AH: {', '.join(codes)}")
-
+ 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_CLONES)
     wanted = codes + (["0025AH"] if do_q and "0025AH" not in codes else [])   # 0025AH holds the Quran
     dirs = dict(zip(wanted, await asyncio.gather(*(clone_repo(c, semaphore) for c in wanted))))
-
+ 
     index = load_quran_index(dirs["0025AH"], QURAN_MIN_WORDS) if do_q else {}
     patterns = ({label: build_pattern(kw, ALLOW_PREFIXES) for kw, label in keywords.items()}
                 if do_k else {})
-
+ 
     jobs = []
     for code in codes:
         paths = [p for p in find_books(dirs[code], PRIMARY_ONLY) if "0001Quran" not in p]
         paths = [p for p in paths if death_ah_of(p) is None or start_ah <= death_ah_of(p) <= end_ah]
         jobs += [(p, code) for p in (paths[:MAX_BOOKS_PER_REPO] if MAX_BOOKS_PER_REPO else paths)]
     print(f"Analysing {len(jobs)} books with {WORKERS} workers ...")
-
+ 
     loop = asyncio.get_running_loop()
     analysed, errors = [], []
     with make_pool(index, patterns) as pool:
@@ -317,7 +323,7 @@ async def run_pipeline(mode=DEFAULT_MODE, keywords=None, start_ah=START_AH, end_
             if done % 100 == 0:
                 print(f"  {done}/{len(jobs)} books done")
         await asyncio.gather(*(one(j) for j in jobs))
-
+ 
     if do_q:     # Q or QK: books quoting the Quran MORE than the threshold, most quotations first
         kept = sorted((b for b in analysed if b["quran_quotes"] > min_quotes),
                       key=lambda b: b["quran_quotes"], reverse=True)
@@ -329,6 +335,7 @@ async def run_pipeline(mode=DEFAULT_MODE, keywords=None, start_ah=START_AH, end_
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "mode": mode, "range_ah": [start_ah, end_ah], "repos": codes,
             "keywords": {label: kw for kw, label in keywords.items()} if do_k else {},
+            "groups": groups or {},                      # {keyword label: [approved synonym labels]}
             "allow_prefixes": ALLOW_PREFIXES, "primary_only": PRIMARY_ONLY,
             "min_quran_quotes": min_quotes if do_q else None,
             "quran_min_words": QURAN_MIN_WORDS if do_q else None,
@@ -346,7 +353,7 @@ async def run_pipeline(mode=DEFAULT_MODE, keywords=None, start_ah=START_AH, end_
     print(f"Saved {OUTPUT_JSON}: {len(kept)} of {len(analysed)} books {what}"
           + (f" ({len(errors)} files failed)" if errors else ""))
     return results
-
+ 
 
 def run_async(coro):
     """Runs a coroutine from a terminal OR from Colab/Jupyter (where an event loop is already running)."""
@@ -361,7 +368,6 @@ def run_async(coro):
 def in_notebook():
     return "google.colab" in sys.modules or "ipykernel" in sys.modules
 
-
 # ---------------------------------------------------------------------------
 # 6. JSON  ->  SIMPLE LIST  (exact numbers, computed here, not by the LLM)
 # ---------------------------------------------------------------------------
@@ -373,7 +379,7 @@ def summarize_results(json_path=OUTPUT_JSON, out_path=OUTPUT_SUMMARY, top=None):
     meta, books = data["meta"], data["books"]
     labels = meta["keywords"]                            # {label: Arabic keyword}
     do_q = "Q" in meta.get("mode", "QK")
-
+ 
     lines = [f"Mode: {meta.get('mode', 'QK')} | range: {meta['range_ah'][0]}-{meta['range_ah'][1]} AH | "
              f"repos: {', '.join(meta['repos'])}"]
     if do_q:
@@ -382,27 +388,124 @@ def summarize_results(json_path=OUTPUT_JSON, out_path=OUTPUT_SUMMARY, top=None):
                   f"Quran quotation = {meta['quran_min_words']}+ identical words in a row shared with a verse."]
     else:
         lines.append(f"Books scanned: {meta['books_scanned']} | books with a keyword hit: {meta['books_kept']}")
+    groups = meta.get("groups") or {}
+    member_of = {m: g for g, members in groups.items() for m in members}
     if labels:
+        def total(ls):
+            return (sum(b["keyword_counts"].get(l, 0) for b in books for l in ls),
+                    sum(1 for b in books if any(b["keyword_counts"].get(l, 0) > 0 for l in ls)))
         lines += ["", "KEYWORD TOTALS (books listed below)"]
         for label, kw in labels.items():
-            hits = sum(b["keyword_counts"].get(label, 0) for b in books)
-            n_books = sum(1 for b in books if b["keyword_counts"].get(label, 0) > 0)
-            lines.append(f"- {kw} ({label}): {hits:,} hits in {n_books} of {len(books)} books")
+            if label in member_of:
+                continue                                  # printed under its group
+            if label in groups:
+                hits, n_books = total([label] + groups[label])
+                lines.append(f"- GROUP {kw} ({label}) incl. approved synonyms: {hits:,} hits in "
+                             f"{n_books} of {len(books)} books")
+                for l in [label] + groups[label]:
+                    h, nb = total([l])
+                    lines.append(f"    - {labels[l]} ({l}): {h:,} hits in {nb} books")
+            else:
+                hits, n_books = total([label])
+                lines.append(f"- {kw} ({label}): {hits:,} hits in {n_books} of {len(books)} books")
     lines += ["", "BOOKS BY QURAN QUOTATIONS (high to low)" if do_q else "BOOKS BY KEYWORD HITS (high to low)"]
     shown = books[:top] if top else books
     for i, b in enumerate(shown, 1):
         parts = ([f"Quran quotations: {b['quran_quotes']:,}"] if do_q else [])
-        parts += [f"{lab} {b['keyword_counts'].get(lab, 0)}" for lab in labels]
+        parts += [f"{lab} {sum(b['keyword_counts'].get(l, 0) for l in [lab] + groups.get(lab, []))}"
+                  for lab in labels if lab not in member_of]
         lines.append(f"{i}. {b['uri']} ({b['death_ah']} AH) - " + "; ".join(parts))
     if top and len(books) > top:
         lines.append(f"... {len(books) - top} more books in {json_path}")
-
+ 
     text = "\n".join(lines)
     if out_path:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
     return text
-
+ 
+# 6b. >>> LLM HELPERS (OpenRouter) + SYNONYM EXPANSION  (new)
+#     The LLM only PROPOSES extra search terms. You approve them, and the script then counts
+#     every approved term exactly like any other keyword. Only the keywords are sent, no book text.
+# ---------------------------------------------------------------------------
+def get_api_key():
+    try:
+        from google.colab import userdata        # Colab secrets
+        return userdata.get("OPENROUTER_API_KEY")
+    except Exception:
+        pass
+    return os.environ.get("OPENROUTER_API_KEY") or getpass.getpass("OpenRouter API key: ")
+ 
+ 
+def call_openrouter(messages, api_key, temperature=0.3):
+    import requests                                   # preinstalled in Colab; else: pip install requests
+    r = requests.post(
+        OPENROUTER_URL, timeout=180,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                 "X-Title": "OpenITI Quran keyword report"},
+        json={"model": OPENROUTER_MODEL, "messages": messages, "temperature": temperature})
+    if r.status_code != 200:
+        hint = {401: "the API key was rejected", 402: "the account has no credit for this model",
+                429: "rate limit reached: wait a minute and run the cell again"}.get(r.status_code, "")
+        raise RuntimeError(f"OpenRouter returned HTTP {r.status_code}"
+                           f"{' - ' + hint if hint else ''}\n{r.text[:300]}")
+    body = r.json()
+    try:
+        return body["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Unexpected reply from OpenRouter: {str(body)[:300]}")
+ 
+ 
+def suggest_synonyms(keywords):
+    """Ask the LLM for related terms. keywords: {Arabic keyword: label}. Returns {keyword: [terms]}."""
+    system = (
+        "You are an expert in classical Arabic and in the technical vocabulary of Islamic law and "
+        f"related disciplines. For each keyword, list up to {SYNONYMS_PER_KEYWORD} Arabic terms that "
+        "classical authors used for the same or a very close concept, including common spelling "
+        "variants. Write them without vowel marks and, for nouns, with the article ال like the "
+        "keyword. Do NOT include words that only share a root but mean something else (for example "
+        "the verb 'he knew' for العرف). No explanations. Answer with JSON only, in this shape: "
+        '{"<keyword>": ["<term>", "<term>"]}')
+    user = "Keywords: " + json.dumps(list(keywords), ensure_ascii=False)
+    reply = call_openrouter([{"role": "system", "content": system}, {"role": "user", "content": user}],
+                            get_api_key(), temperature=0.2)
+    match = re.search(r"\{.*\}", reply, re.S)             # tolerate ```json fences around the answer
+    if not match:
+        raise RuntimeError(f"The LLM did not return JSON:\n{reply[:300]}")
+    proposals = json.loads(match.group(0))
+    clean = {}
+    for kw in keywords:
+        seen, terms = {normalize(kw)}, []
+        for t in proposals.get(kw, []):
+            t = " ".join(str(t).split())
+            if t and len(t.split()) <= 4 and normalize(t) not in seen:
+                seen.add(normalize(t))
+                terms.append(t)
+        clean[kw] = terms[:SYNONYMS_PER_KEYWORD]
+    return clean
+ 
+ 
+def expand_with_llm(keywords):
+    """Show the LLM's proposals, let the user approve them, and return
+    (keywords incl. approved terms, groups {keyword label: [synonym labels]})."""
+    try:
+        proposals = suggest_synonyms(keywords)
+    except Exception as e:                                # no key, no network, bad reply: carry on without
+        print(f"  Could not get synonyms ({e}). Continuing with your keywords only.")
+        return keywords, {}
+    expanded, groups = dict(keywords), {}
+    for kw, label in keywords.items():
+        terms = proposals.get(kw, [])
+        if not terms:
+            continue
+        print(f"\n  {kw}  ->  " + "   ".join(f"{i}. {t}" for i, t in enumerate(terms, 1)))
+        answer = ask("  Keep which? numbers like 1,3 | a = all | Enter = none", "").lower()
+        picked = terms if answer == "a" else [terms[int(n) - 1] for n in re.findall(r"\d+", answer)
+                                              if 0 < int(n) <= len(terms)]
+        for i, term in enumerate(picked, 1):
+            expanded[term] = f"{label}+{i}"
+            groups.setdefault(label, []).append(f"{label}+{i}")
+    return expanded, groups
 
 # ---------------------------------------------------------------------------
 # 7. COMMAND LINE: ask what to run and what to search
@@ -443,8 +546,8 @@ def ask_user():
         if mode in ("Q", "K", "QK"):
             break
         print("  Please type Q, K or QK.")
-
-    keywords = None
+ 
+    keywords, groups = None, {}
     if "K" in mode:
         print("\nKeywords: Arabic, separated by commas. Write nouns with the article (العرف, not عرف).")
         print("Optional short label after =, e.g.  العرف=al_urf, ضرورة=darura")
@@ -454,7 +557,10 @@ def ask_user():
             if keywords:
                 break
             print("  Please give at least one keyword.")
-
+        # >>> LLM INJECTION POINT: optional synonym expansion (new)
+        if ask("\nAsk the LLM (OpenRouter) to propose synonyms for you to approve? (y/N)", "n").lower().startswith("y"):
+            keywords, groups = expand_with_llm(keywords)
+ 
     print("\nYear range = author DEATH dates in hijri years, e.g. 800-900.")
     while True:
         numbers = re.findall(r"\d+", ask("Year range (AH)", f"{START_AH}-{END_AH}"))
@@ -463,7 +569,7 @@ def ask_user():
             if repos_for_range(start_ah, end_ah):
                 break
         print("  Please give two years between 1 and 1450, like 800-900.")
-
+ 
     min_quotes = MIN_QURAN_QUOTES
     if "Q" in mode:
         print("\nOnly books that quote the Quran MORE than this many times are kept.")
@@ -473,19 +579,19 @@ def ask_user():
                 min_quotes = int(answer)
                 break
             print("  Please type a whole number.")
-
+ 
     print(f"\nRunning {mode} for {start_ah}-{end_ah} AH"
           + (f", keywords: {', '.join(keywords)}" if keywords else "")
           + (f", more than {min_quotes} Quran quotations" if "Q" in mode else "") + "\n")
     return {"mode": mode, "keywords": keywords, "start_ah": start_ah, "end_ah": end_ah,
-            "min_quotes": min_quotes}
-
-
+            "min_quotes": min_quotes, "groups": groups}
+ 
+ 
 def main():
     results = run_async(run_pipeline(**ask_user()))
     print()
     print(summarize_results())
     return results
-
-
+ 
+ 
 results = main()
